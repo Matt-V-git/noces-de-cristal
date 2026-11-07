@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#05061a" />
+    <title>Noces de Cristal</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon-192.png" />
+    <style>
+      @font-face { font-family: 'Pixel'; src: url('jersey-10.woff2') format('woff2'); font-display: swap; }
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 22px/1.25 'Pixel', monospace; }
+      body { display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; }
+      form {
+        box-sizing: border-box; width: min(340px, 100%); padding: 20px; display: grid; gap: 14px;
+        background: linear-gradient(135deg, #3a46d6, #0a0e54); border: 2px solid #f4f6ff; border-radius: 8px;
+        box-shadow: 0 0 0 2px #10102a, inset 0 0 0 1px #969cbe;
+      }
+      h1 { margin: 0; font-size: 30px; font-weight: 400; text-align: center; }
+      label { display: grid; gap: 6px; }
+      input, button { font: inherit; border-radius: 4px; padding: 10px 12px; box-sizing: border-box; width: 100%; }
+      input { background: #000; color: #fff; border: 1px solid #969cbe; }
+      button { background: #fff2a8; color: #1a1424; border: 0; }
+      button:disabled { opacity: 0.6; }
+      p { margin: 0; min-height: 28px; text-align: center; color: #ffe27a; }
+    </style>
+  </head>
+  <body>
+    <form id="porte" hidden>
+      <h1>Noces de Cristal</h1>
+      <label>Mot de passe
+        <input id="mdp" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" />
+      </label>
+      <button id="ok" type="submit">Entrer</button>
+      <p id="msg" role="status"></p>
+    </form>
+    <script type="module">
+      // Tout le contenu est chiffré (AES-256-GCM, clé dérivée du mot de passe par PBKDF2).
+      // Cette page ne contient et ne vérifie aucun secret : sans le bon mot de passe, game.bin reste illisible.
+      const CLE = 'noces.cle.v1';
+      const form = document.getElementById('porte');
+      const input = document.getElementById('mdp');
+      const bouton = document.getElementById('ok');
+      const msg = document.getElementById('msg');
+
+      const lire = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+      const ecrire = (k, v) => { try { localStorage.setItem(k, v); } catch { /* facultatif */ } };
+      const effacer = (k) => { try { localStorage.removeItem(k); } catch { /* facultatif */ } };
+
+      const normaliser = (s) => s.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().trim().replace(/\s+/g, ' ');
+      const versB64 = (u8) => btoa(String.fromCharCode(...u8));
+      const depuisB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+      async function derive(mdp, sel, tours) {
+        const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(normaliser(mdp)), 'PBKDF2', false, ['deriveBits']);
+        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: sel, iterations: tours }, base, 256);
+        return new Uint8Array(bits);
+      }
+
+      async function ouvrir(brut, cleBrute) {
+        const entete = new DataView(brut.buffer, brut.byteOffset, 8);
+        if (entete.getUint32(0) !== 0x4e444331) throw new Error('format');
+        const iv = brut.subarray(24, 36);
+        const cle = await crypto.subtle.importKey('raw', cleBrute, 'AES-GCM', false, ['decrypt']);
+        const clair = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cle, brut.subarray(36));
+        const flux = new Blob([clair]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return new Response(flux).blob();
+      }
+
+      function lancer(js) {
+        form.remove();
+        document.body.removeAttribute('style');
+        const s = document.createElement('script');
+        s.type = 'module';
+        s.src = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+        document.body.append(s);
+      }
+
+      async function essayer(brut, mdp) {
+        const vue = new DataView(brut.buffer, brut.byteOffset, 8);
+        const cle = await derive(mdp, brut.subarray(8, 24), vue.getUint32(4));
+        const js = await ouvrir(brut, cle);
+        ecrire(CLE, versB64(cle));
+        lancer(js);
+      }
+
+      async function demarrer() {
+        const reponse = await fetch('game.bin', { cache: 'no-cache' });
+        if (!reponse.ok) throw new Error('chargement');
+        const brut = new Uint8Array(await reponse.arrayBuffer());
+
+        // Déjà ouvert sur ce téléphone : pas besoin de ressaisir le mot de passe.
+        const memo = lire(CLE);
+        if (memo) {
+          try {
+            return lancer(await ouvrir(brut, depuisB64(memo)));
+          } catch {
+            effacer(CLE);
+          }
+        }
+        // Lien direct : le mot de passe peut suivre le # de l'adresse, jamais envoyé au serveur.
+        const dieze = new URLSearchParams(location.hash.slice(1)).get('mdp');
+        history.replaceState(null, '', location.pathname);
+        if (dieze) {
+          try {
+            return await essayer(brut, dieze);
+          } catch { /* on retombe sur le formulaire */ }
+        }
+        form.hidden = false;
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          bouton.disabled = true;
+          msg.textContent = 'Ouverture…';
+          try {
+            await essayer(brut, input.value);
+          } catch {
+            msg.textContent = 'Ce n’est pas le bon mot de passe.';
+            bouton.disabled = false;
+          }
+        });
+      }
+
+      demarrer().catch(() => {
+        form.hidden = false;
+        form.replaceChildren(Object.assign(document.createElement('p'), { textContent: 'Impossible de charger la page. Vérifie ta connexion, puis recharge.' }));
+      });
+    </script>
+  </body>
+</html>
